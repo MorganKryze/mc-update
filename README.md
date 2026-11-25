@@ -1,5 +1,8 @@
 # mc-update
 
+[![ci](https://github.com/MorganKryze/mc-update/actions/workflows/ci.yml/badge.svg)](https://github.com/MorganKryze/mc-update/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/MorganKryze/mc-update)](https://github.com/MorganKryze/mc-update/releases/latest)
+
 mc-update keeps the MinIO client (`mc`) free of known vulnerabilities on networks that
 cannot reach the internet. On a connected machine, it fetches a pinned commit of mc,
 checks it against a SHA-256 kept in this repository, raises the vulnerable Go modules
