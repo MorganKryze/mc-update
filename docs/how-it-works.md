@@ -17,29 +17,31 @@ proxy.golang.org. A build host on an isolated network cannot do it.
 
 ## The two sides
 
-```text
-connected machine                                offline network
------------------                                ---------------
-bin/mc-update all
-  fetch   mc source at a fixed commit
-  bump    raise the vulnerable modules
-  pack    copy every dependency into vendor/,
-          test build, archive + SHA-256
-             |
-             |   mc-<commit>-<date>.tar.gz
-             |   mc-<commit>-<date>.tar.gz.sha256
-             +-------------- transfer -------------> file server
-                                                         |
-                                                         v
-                                                 docker build
-                                                   check the SHA-256
-                                                   go build, no network
-                                                   image holding /mc
+```mermaid
+flowchart LR
+  subgraph connected [Connected machine]
+    direction TB
+    fetch["fetch<br/>pinned commit, checked against sources.lock"]
+    bump["bump<br/>raise the vulnerable modules"]
+    pack["pack<br/>vendor/, test build, archive + SHA-256"]
+    fetch --> bump --> pack
+  end
+  subgraph offline [Offline network]
+    direction TB
+    files[(internal file server)]
+    build["docker build<br/>check the SHA-256, go build without network"]
+    image["image holding /mc"]
+    files --> build --> image
+  end
+  pack -- "archive and its .sha256" --> files
 ```
 
 Everything that needs the internet happens on the connected side. The offline build reads
 the archive and a Go image, and nothing else: the Dockerfile sets `GOPROXY=off` and
 `GOTOOLCHAIN=local`, and the build passes with `docker build --network=none`.
+
+`fetch` checks the source against `sources.lock` before anything else, whether it comes
+from a repository or an archive: see [Source integrity](integrity.md).
 
 ## Six Go notions
 
@@ -80,10 +82,12 @@ on the image.
 
 | Path | Content |
 | --- | --- |
-| `mc-src/` | mc source at the fixed commit, with the raised `go.mod` and `go.sum` |
+| `mc-src/` | mc source at the pinned commit, with the raised `go.mod` and `go.sum` |
 | `mc-src/vendor/` | source of every dependency |
 | `mc-src/.mc-update/commit` | full mc commit hash |
-| `mc-src/.mc-update/go.mod.orig` | `go.mod` before any raise |
+| `mc-src/.mc-update/tree-sha256` | tree hash checked against `sources.lock` |
+| `mc-src/.mc-update/source` | repository or archive the source came from |
+| `mc-src/.mc-update/go.mod.orig`, `go.sum.orig` | `go.mod` and `go.sum` before any raise |
 | `mc-src/.mc-update/changes` | difference between `go.mod.orig` and the final `go.mod` |
 | `mc-src/.mc-update/go-min` | oldest Go version able to build the tree |
 | `mc-src/.mc-update/go-image`, `go-build` | Go image and version of the test build |

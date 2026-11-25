@@ -41,6 +41,12 @@ version from git, which the archive does not carry. The commit identifies the so
 | Message | Cause | Fix |
 | --- | --- | --- |
 | `mc-src already exists` | `fetch` never overwrites | remove the directory, or pass `-d` |
+| `no repository in MC_UPDATE_REPOS gave commit …` | every repository was unreachable or lacks the commit | check the network, or `fetch -a` from an archive |
+| `commit … is not in sources.lock` | the commit has no pin | see [Pin a new commit](integrity.md#pin-a-new-commit) |
+| `the source of … differs from its pin` | someone altered the source, or it arrived incomplete | fetch from another repository or archive; never edit the pin to match |
+| `the source tree hashes to …, which no line of sources.lock pins` | an archive whose source matches no pinned commit | use an archive made from a pinned commit |
+| `… does not match ….sha256` | the archive differs from the checksum next to it | transfer the archive again |
+| `mc-src changed since fetch beyond go.mod and go.sum` | a source file changed between `fetch` and `pack` | fetch again |
 | `mc-src holds no source fetched by mc-update` | `check`, `bump` or `pack` on a directory `fetch` did not create | run `fetch` first |
 | `jq is required` | `check` and `bump` parse govulncheck's JSON with jq | install jq |
 | `/tmp/mc.tar.gz: FAILED` during `docker build` | the archive's SHA-256 differs from `MC_ARCHIVE_SHA256` | transfer the archive again, check the value you passed |

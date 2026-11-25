@@ -59,7 +59,7 @@ mc version DEVELOPMENT.GOGET (commit-id=77f82e18b5401a65958f1619df6ebb994634bd88
 
 $ docker image inspect registry.internal/mc:77f82e18b540 \
     --format '{{index .Config.Labels "mc-update.archive.sha256"}}'
-cf5fc321220842ab5369ebf81f35e0285b3a57c22551a168dac4b8cb8d21bd7e
+7232fcf9e7cba5e1a7a252364e13867c38b39aac65a1b90409e0bf09471e528a
 ```
 
 Scan the image with your scanner. For the archive above, Trivy reports no vulnerability.
