@@ -1,0 +1,283 @@
+#!/usr/bin/env bash
+# mc-update prepares the MinIO client (mc) source for an offline build: it fetches a
+# fixed commit, raises the Go modules that carry known vulnerabilities, vendors every
+# dependency and packs the result into one archive.
+set -euo pipefail
+
+VERSION=0.1.0
+MC_REPO=${MC_UPDATE_REPO:-https://github.com/minio/mc}
+DEFAULT_COMMIT=77f82e18b5401a65958f1619df6ebb994634bd88
+GO_IMAGE=${MC_UPDATE_GO_IMAGE:-golang:1.27}
+GOVULNCHECK=${MC_UPDATE_GOVULNCHECK:-golang.org/x/vuln/cmd/govulncheck@latest}
+CACHE=${MC_UPDATE_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/mc-update}
+
+usage() {
+	cat <<EOF
+mc-update $VERSION: prepare the MinIO client source for an offline build.
+
+Usage:
+  mc-update fetch [-c COMMIT] [-d DIR]   fetch mc at COMMIT into DIR
+  mc-update check [-d DIR]               list the vulnerable Go modules in DIR
+  mc-update bump  [-d DIR] [MODULE[@VERSION]...]
+                                         raise modules; with none given, raise each
+                                         vulnerable module to its first fixed version
+  mc-update pack  [-d DIR] [-o OUTDIR]   vendor, test the build, write the archive
+  mc-update all   [-c COMMIT] [-d DIR] [-o OUTDIR]
+                                         fetch, bump and pack in one go
+
+Defaults: COMMIT $DEFAULT_COMMIT, DIR mc-src, OUTDIR the current directory.
+
+Environment:
+  MC_UPDATE_GO_IMAGE     Go image used for every Go command ($GO_IMAGE)
+  MC_UPDATE_GOVULNCHECK  govulncheck module to run ($GOVULNCHECK)
+  MC_UPDATE_REPO         mc repository ($MC_REPO)
+  MC_UPDATE_CACHE        Go module and build cache ($CACHE)
+EOF
+}
+
+die() {
+	printf 'mc-update: %s\n' "$*" >&2
+	exit 1
+}
+
+need() {
+	command -v "$1" >/dev/null 2>&1 || die "$1 is required"
+}
+
+sha256() {
+	if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi
+}
+
+# go_run DIR CMD... runs CMD in the Go image with DIR mounted at /src. It runs as the
+# calling user so the files it writes stay yours, and keeps the Go caches between runs.
+go_run() {
+	local dir=$1
+	shift
+	mkdir -p "$CACHE"
+	docker run --rm --user "$(id -u):$(id -g)" \
+		-v "$(cd "$dir" && pwd):/src" -v "$CACHE:/cache" -w /src \
+		-e HOME=/cache -e GOPATH=/cache/go -e GOCACHE=/cache/build -e GOFLAGS=-modcacherw \
+		"$GO_IMAGE" "$@"
+}
+
+require_source() {
+	[ -f "$1/go.mod" ] && [ -d "$1/.mc-update" ] || die "$1 holds no source fetched by mc-update; run: mc-update fetch -d $1"
+}
+
+cmd_fetch() {
+	local commit=$DEFAULT_COMMIT dir=mc-src opt
+	OPTIND=1
+	while getopts c:d: opt; do
+		case $opt in
+		c) commit=$OPTARG ;;
+		d) dir=$OPTARG ;;
+		*) die "unknown option; see mc-update help" ;;
+		esac
+	done
+	need git
+	[ -e "$dir" ] && die "$dir already exists; remove it or pick another with -d"
+
+	git init --quiet "$dir"
+	git -C "$dir" fetch --quiet --depth 1 "$MC_REPO" "$commit"
+	git -C "$dir" checkout --quiet FETCH_HEAD
+	mkdir "$dir/.mc-update"
+	git -C "$dir" rev-parse HEAD >"$dir/.mc-update/commit"
+	cp "$dir/go.mod" "$dir/.mc-update/go.mod.orig"
+	rm -rf "$dir/.git"
+	echo "Fetched mc $(cut -c1-12 "$dir/.mc-update/commit") into $dir"
+}
+
+# vulnerable_modules DIR prints one line per finding: module, version in use, first
+# fixed version, advisory id. -scan module reports every advisory on a required module,
+# as image scanners do, not only the ones whose code mc calls.
+vulnerable_modules() {
+	go_run "$1" go run "$GOVULNCHECK" -scan module -format json |
+		jq -r 'select(.finding) | .finding
+		| [.trace[0].module, (.trace[0].version // "-"), (.fixed_version // "none"), .osv] | @tsv' |
+		sort -u
+}
+
+cmd_check() {
+	local dir=mc-src opt findings
+	OPTIND=1
+	while getopts d: opt; do
+		case $opt in
+		d) dir=$OPTARG ;;
+		*) die "unknown option; see mc-update help" ;;
+		esac
+	done
+	need docker
+	need jq
+	require_source "$dir"
+
+	findings=$(vulnerable_modules "$dir")
+	if [ -z "$findings" ]; then
+		echo "No known vulnerability in the modules of $dir."
+		return
+	fi
+	{
+		printf 'MODULE\tIN USE\tFIXED IN\tADVISORY\n'
+		printf '%s\n' "$findings"
+	} | column -t -s "$(printf '\t')"
+	if printf '%s\n' "$findings" | cut -f1 | grep -qx stdlib; then
+		echo
+		echo "stdlib findings come from the Go version that builds mc: build with a newer Go image."
+	fi
+}
+
+# fix_targets DIR prints module@version for each vulnerable module: the highest of its
+# first fixed versions, the smallest raise that clears every advisory known on it.
+fix_targets() {
+	vulnerable_modules "$1" |
+		awk -F'\t' '$1 != "stdlib" && $3 != "none" { print $1 "\t" $3 }' |
+		sort -t "$(printf '\t')" -k1,1 -k2,2V |
+		awk -F'\t' '{ last[$1] = $2 } END { for (m in last) print m "@" last[m] }' |
+		sort | tr '\n' ' '
+}
+
+# raise DIR TARGET... raises one module at a time, and only upward: raising x/net can
+# already pull x/sys past its own target, and asking for that lower target would pull
+# x/net back down.
+raise() {
+	local dir=$1
+	shift
+	# shellcheck disable=SC2016 # $ expands inside the Go image
+	go_run "$dir" sh -c '
+		set -e
+		for target in "$@"; do
+			case $target in
+			*@*) module=${target%@*} want=${target#*@} ;;
+			*) module=$target want=latest ;;
+			esac
+			have=$(go list -m -f "{{.Version}}" "$module")
+			if [ "$want" = latest ]; then
+				raise=yes
+			elif [ "$have" != "$want" ] && [ "$(printf "%s\n%s\n" "$have" "$want" | sort -V | head -n1)" = "$have" ]; then
+				raise=yes
+			else
+				raise=no
+			fi
+			if [ $raise = yes ]; then
+				echo "  $module $have -> $want"
+				go get "$module@$want"
+			else
+				echo "  $module $have already covers $want"
+			fi
+		done
+		go mod tidy' sh "$@"
+}
+
+cmd_bump() {
+	local dir=mc-src opt targets previous="" pass
+	OPTIND=1
+	while getopts d: opt; do
+		case $opt in
+		d) dir=$OPTARG ;;
+		*) die "unknown option; see mc-update help" ;;
+		esac
+	done
+	shift $((OPTIND - 1))
+	need docker
+	require_source "$dir"
+
+	if [ $# -gt 0 ]; then
+		echo "Raising modules in $dir:"
+		raise "$dir" "$@"
+	else
+		need jq
+		# A module can carry fixes on several release lines: once raised to v1.83.1, the
+		# fix it needs may be v1.83.2. Scan again until nothing is left or nothing moves.
+		for pass in 1 2 3 4 5; do
+			targets=$(fix_targets "$dir")
+			if [ -z "${targets// /}" ]; then
+				[ "$pass" = 1 ] && echo "Nothing to raise in $dir."
+				break
+			fi
+			if [ "$targets" = "$previous" ]; then
+				echo "Stopped: these modules have no newer fix: $targets"
+				break
+			fi
+			echo "Raising modules in $dir (pass $pass):"
+			# shellcheck disable=SC2086 # one word per module
+			raise "$dir" $targets
+			previous=$targets
+		done
+	fi
+
+	echo
+	echo "Changes to go.mod:"
+	{ diff "$dir/.mc-update/go.mod.orig" "$dir/go.mod" || true; } |
+		sed -n 's/^< /  - /p; s/^> /  + /p' | tr -d '\t' | grep -v '^  [-+] *$' || echo "  none"
+}
+
+cmd_pack() {
+	local dir=mc-src out=. opt commit name archive
+	OPTIND=1
+	while getopts d:o: opt; do
+		case $opt in
+		d) dir=$OPTARG ;;
+		o) out=$OPTARG ;;
+		*) die "unknown option; see mc-update help" ;;
+		esac
+	done
+	need docker
+	require_source "$dir"
+	mkdir -p "$out"
+
+	echo "Vendoring and test build with $GO_IMAGE..."
+	go_run "$dir" sh -c '
+		set -e
+		go mod tidy
+		go mod vendor
+		CGO_ENABLED=0 go build -mod=vendor -trimpath -o /tmp/mc .
+		/tmp/mc --version >/dev/null
+		go version | cut -d" " -f3 > .mc-update/go-build
+		sed -n "s/^go //p" go.mod > .mc-update/go-min'
+	diff "$dir/.mc-update/go.mod.orig" "$dir/go.mod" >"$dir/.mc-update/changes" || true
+	echo "$GO_IMAGE" >"$dir/.mc-update/go-image"
+
+	commit=$(cut -c1-12 "$dir/.mc-update/commit")
+	name="mc-$commit-$(date -u +%Y%m%d)"
+	archive="$out/$name.tar.gz"
+	tar -czf "$archive" -C "$(dirname "$dir")" "$(basename "$dir")"
+	(cd "$out" && sha256 "$name.tar.gz") >"$archive.sha256"
+
+	echo
+	echo "Archive: $archive ($(du -h "$archive" | awk '{print $1}'))"
+	echo "SHA-256: $(cut -d' ' -f1 "$archive.sha256")"
+	echo "Needs Go $(cat "$dir/.mc-update/go-min") or later to build; tested with $(cat "$dir/.mc-update/go-build")."
+	echo
+	echo "Next: move both files to the offline side and build with docker/Dockerfile."
+}
+
+cmd_all() {
+	local commit=$DEFAULT_COMMIT dir=mc-src out=. opt
+	OPTIND=1
+	while getopts c:d:o: opt; do
+		case $opt in
+		c) commit=$OPTARG ;;
+		d) dir=$OPTARG ;;
+		o) out=$OPTARG ;;
+		*) die "unknown option; see mc-update help" ;;
+		esac
+	done
+	cmd_fetch -c "$commit" -d "$dir"
+	echo
+	cmd_bump -d "$dir"
+	echo
+	cmd_pack -d "$dir" -o "$out"
+}
+
+case ${1:-help} in
+fetch | check | bump | pack | all)
+	cmd=$1
+	shift
+	"cmd_$cmd" "$@"
+	;;
+version | --version) echo "mc-update $VERSION" ;;
+help | -h | --help) usage ;;
+*)
+	usage >&2
+	exit 2
+	;;
+esac
