@@ -1,0 +1,4 @@
+# Commits of mc that mc-update accepts, with the SHA-256 of their source tree.
+# fetch refuses any source, from a repository or an archive, whose tree differs.
+# Add a line only for a commit from a repository you trust, in a reviewed commit.
+77f82e18b5401a65958f1619df6ebb994634bd88 19c628dca77281967763c118a1f5a3cd3c8cf6a7b03eb4f7c2c3a9039bebb797

@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # mc-update prepares the MinIO client (mc) source for an offline build: it fetches a
-# fixed commit, raises the Go modules that carry known vulnerabilities, vendors every
+# pinned commit, raises the Go modules that carry known vulnerabilities, vendors every
 # dependency and packs the result into one archive.
 set -euo pipefail
 
 VERSION=0.1.0
-MC_REPO=${MC_UPDATE_REPO:-https://github.com/minio/mc}
-DEFAULT_COMMIT=77f82e18b5401a65958f1619df6ebb994634bd88
+ROOT=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)
+LOCK=${MC_UPDATE_LOCK:-$ROOT/sources.lock}
+REPOS=${MC_UPDATE_REPOS:-https://github.com/minio/mc https://github.com/MorganKryze/mc}
 GO_IMAGE=${MC_UPDATE_GO_IMAGE:-golang:1.27}
 GOVULNCHECK=${MC_UPDATE_GOVULNCHECK:-golang.org/x/vuln/cmd/govulncheck@latest}
 CACHE=${MC_UPDATE_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/mc-update}
@@ -16,21 +17,27 @@ usage() {
 mc-update $VERSION: prepare the MinIO client source for an offline build.
 
 Usage:
-  mc-update fetch [-c COMMIT] [-d DIR]   fetch mc at COMMIT into DIR
-  mc-update check [-d DIR]               list the vulnerable Go modules in DIR
+  mc-update fetch [-c COMMIT | -a ARCHIVE] [-d DIR]
+                         get mc into DIR from the repositories, or from ARCHIVE,
+                         and check it against sources.lock
+  mc-update check [-d DIR]
+                         list the vulnerable Go modules in DIR
   mc-update bump  [-d DIR] [MODULE[@VERSION]...]
-                                         raise modules; with none given, raise each
-                                         vulnerable module to its first fixed version
-  mc-update pack  [-d DIR] [-o OUTDIR]   vendor, test the build, write the archive
-  mc-update all   [-c COMMIT] [-d DIR] [-o OUTDIR]
-                                         fetch, bump and pack in one go
+                         raise modules; with none given, raise each vulnerable
+                         module to its first fixed version
+  mc-update pack  [-d DIR] [-o OUTDIR]
+                         vendor, test the build, write the archive
+  mc-update all   [-c COMMIT | -a ARCHIVE] [-d DIR] [-o OUTDIR]
+                         fetch, bump and pack in one go
 
-Defaults: COMMIT $DEFAULT_COMMIT, DIR mc-src, OUTDIR the current directory.
+Defaults: COMMIT the last line of sources.lock, DIR mc-src, OUTDIR the current
+directory.
 
 Environment:
+  MC_UPDATE_REPOS        repositories tried in order ($REPOS)
+  MC_UPDATE_LOCK         pinned commits and source hashes ($LOCK)
   MC_UPDATE_GO_IMAGE     Go image used for every Go command ($GO_IMAGE)
   MC_UPDATE_GOVULNCHECK  govulncheck module to run ($GOVULNCHECK)
-  MC_UPDATE_REPO         mc repository ($MC_REPO)
   MC_UPDATE_CACHE        Go module and build cache ($CACHE)
 EOF
 }
@@ -61,30 +68,171 @@ go_run() {
 }
 
 require_source() {
-	[ -f "$1/go.mod" ] && [ -d "$1/.mc-update" ] || die "$1 holds no source fetched by mc-update; run: mc-update fetch -d $1"
+	[ -f "$1/go.mod" ] && [ -f "$1/.mc-update/commit" ] ||
+		die "$1 holds no source fetched by mc-update; run: mc-update fetch -d $1"
+}
+
+pinned_tree() { awk -v c="$1" '!/^#/ && $1 == c { print $2 }' "$LOCK"; }
+pinned_commit() { awk -v t="$1" '!/^#/ && $2 == t { print $1 }' "$LOCK"; }
+default_commit() { awk '!/^#/ && NF { c = $1 } END { print c }' "$LOCK"; }
+
+# tree_sha256 DIR hashes the source as the pinned commit holds it: every file path and
+# content, symlinks included, with go.mod and go.sum taken from their saved originals.
+# vendor/ and .mc-update/ are left out: mc-update writes them.
+tree_sha256() {
+	# shellcheck disable=SC2016 # expanded by the shell inside the Go image
+	go_run "$1" sh -c '
+		set -e
+		skip="-path ./.git -o -path ./vendor -o -path ./.mc-update"
+		{
+			find . \( $skip \) -prune -o -type f ! -path ./go.mod ! -path ./go.sum -print0 |
+				xargs -0 -r sha256sum
+			for f in go.mod go.sum; do
+				src=$f
+				[ -f .mc-update/$f.orig ] && src=.mc-update/$f.orig
+				[ -f "$src" ] && printf "%s  ./%s\n" "$(sha256sum <"$src" | cut -d" " -f1)" "$f"
+			done
+			find . \( $skip \) -prune -o -type l -printf "link %p %l\n"
+		} | LC_ALL=C sort -k2 | sha256sum | cut -d" " -f1'
+}
+
+# save_originals DIR keeps the pristine go.mod and go.sum that bump will change.
+save_originals() {
+	mkdir -p "$1/.mc-update"
+	cp "$1/go.mod" "$1/.mc-update/go.mod.orig"
+	cp "$1/go.sum" "$1/.mc-update/go.sum.orig"
+}
+
+# from_repos COMMIT DIR fetches COMMIT from the first repository that has it.
+from_repos() {
+	local commit=$1 dir=$2 repo tmp
+	need git
+	printf '%s\n' "$commit" | grep -qE '^[0-9a-f]{40}$' || die "COMMIT must be a full 40-character hash"
+	for repo in $REPOS; do
+		tmp=$(mktemp -d "$(dirname "$dir")/.mc-update.XXXXXX")
+		if git init --quiet "$tmp" &&
+			git -C "$tmp" fetch --quiet --depth 1 "$repo" "$commit" 2>/dev/null &&
+			git -C "$tmp" checkout --quiet FETCH_HEAD &&
+			[ "$(git -C "$tmp" rev-parse HEAD)" = "$commit" ]; then
+			rm -rf "$tmp/.git"
+			mv "$tmp" "$dir"
+			save_originals "$dir"
+			echo "$repo" >"$dir/.mc-update/source"
+			return
+		fi
+		rm -rf "$tmp"
+		echo "  $repo: unreachable, or without commit ${commit:0:12}" >&2
+	done
+	die "no repository in MC_UPDATE_REPOS gave commit ${commit:0:12}"
+}
+
+# from_archive ARCHIVE DIR unpacks a tar archive of the mc source, such as one made by
+# pack, and brings it back to the pinned state: no vendor/, original go.mod and go.sum.
+from_archive() {
+	local archive=$1 dir=$2 tmp root entries expected
+	[ -f "$archive" ] || die "$archive: no such file"
+	if [ -f "$archive.sha256" ]; then
+		expected=$(cut -d' ' -f1 "$archive.sha256")
+		[ "$(sha256 "$archive" | cut -d' ' -f1)" = "$expected" ] ||
+			die "$archive does not match $archive.sha256"
+		echo "Archive matches $(basename "$archive").sha256"
+	fi
+
+	tmp=$(mktemp -d "$(dirname "$dir")/.mc-update.XXXXXX")
+	tar -xf "$archive" -C "$tmp" || {
+		rm -rf "$tmp"
+		die "$archive: not a tar archive"
+	}
+	root=$tmp
+	entries=$(find "$tmp" -mindepth 1 -maxdepth 1 | wc -l)
+	if [ "$entries" -eq 1 ] && [ -d "$(find "$tmp" -mindepth 1 -maxdepth 1)" ]; then
+		root=$(find "$tmp" -mindepth 1 -maxdepth 1)
+	fi
+	[ -f "$root/go.mod" ] || {
+		rm -rf "$tmp"
+		die "$archive holds no Go module at its top"
+	}
+
+	rm -rf "$root/vendor"
+	for f in go.mod go.sum; do
+		[ -f "$root/.mc-update/$f.orig" ] && cp "$root/.mc-update/$f.orig" "$root/$f"
+	done
+	local claimed=""
+	[ -f "$root/.mc-update/commit" ] && claimed=$(cat "$root/.mc-update/commit")
+	rm -rf "$root/.mc-update"
+	mv "$root" "$dir"
+	rm -rf "$tmp"
+	save_originals "$dir"
+	echo "archive $(basename "$archive")" >"$dir/.mc-update/source"
+	[ -n "$claimed" ] && echo "$claimed" >"$dir/.mc-update/claimed"
+	return 0
+}
+
+# verify DIR [COMMIT] checks the source tree against sources.lock. With COMMIT, the tree
+# must match that commit's pin; without it, the tree must match one of the pins.
+verify() {
+	local dir=$1 commit=${2:-} tree pinned source
+	tree=$(tree_sha256 "$dir")
+	source=$(cat "$dir/.mc-update/source")
+	if [ -z "$commit" ] && [ -f "$dir/.mc-update/claimed" ]; then
+		commit=$(cat "$dir/.mc-update/claimed")
+	fi
+	if [ -n "$commit" ]; then
+		pinned=$(pinned_tree "$commit")
+		if [ -z "$pinned" ]; then
+			rm -rf "$dir"
+			die "commit ${commit:0:12} is not in $LOCK.
+It came from $source and its source tree hashes to $tree.
+Add this line to sources.lock only if you trust that source:
+$commit $tree"
+		fi
+	else
+		commit=$(pinned_commit "$tree")
+		pinned=$tree
+		if [ -z "$commit" ]; then
+			rm -rf "$dir"
+			die "the source tree hashes to $tree, which no line of $LOCK pins"
+		fi
+	fi
+	if [ "$tree" != "$pinned" ]; then
+		rm -rf "$dir"
+		die "the source of ${commit:0:12} differs from its pin in $LOCK.
+  expected $pinned
+  got      $tree
+Refusing it: the source was altered, or fetched incompletely."
+	fi
+	rm -f "$dir/.mc-update/claimed"
+	echo "$commit" >"$dir/.mc-update/commit"
+	echo "$tree" >"$dir/.mc-update/tree-sha256"
 }
 
 cmd_fetch() {
-	local commit=$DEFAULT_COMMIT dir=mc-src opt
+	local commit="" archive="" dir=mc-src opt
 	OPTIND=1
-	while getopts c:d: opt; do
+	while getopts c:a:d: opt; do
 		case $opt in
 		c) commit=$OPTARG ;;
+		a) archive=$OPTARG ;;
 		d) dir=$OPTARG ;;
 		*) die "unknown option; see mc-update help" ;;
 		esac
 	done
-	need git
+	[ -n "$commit" ] && [ -n "$archive" ] && die "use -c or -a, not both"
+	need docker
+	[ -f "$LOCK" ] || die "$LOCK not found"
 	[ -e "$dir" ] && die "$dir already exists; remove it or pick another with -d"
+	mkdir -p "$(dirname "$dir")"
 
-	git init --quiet "$dir"
-	git -C "$dir" fetch --quiet --depth 1 "$MC_REPO" "$commit"
-	git -C "$dir" checkout --quiet FETCH_HEAD
-	mkdir "$dir/.mc-update"
-	git -C "$dir" rev-parse HEAD >"$dir/.mc-update/commit"
-	cp "$dir/go.mod" "$dir/.mc-update/go.mod.orig"
-	rm -rf "$dir/.git"
-	echo "Fetched mc $(cut -c1-12 "$dir/.mc-update/commit") into $dir"
+	if [ -n "$archive" ]; then
+		from_archive "$archive" "$dir"
+		verify "$dir"
+	else
+		commit=${commit:-$(default_commit)}
+		from_repos "$commit" "$dir"
+		verify "$dir" "$commit"
+	fi
+	echo "Fetched mc $(cut -c1-12 "$dir/.mc-update/commit") from $(cat "$dir/.mc-update/source") into $dir"
+	echo "Source matches sources.lock (tree sha256 $(cut -c1-16 "$dir/.mc-update/tree-sha256")...)"
 }
 
 # vulnerable_modules DIR prints one line per finding: module, version in use, first
@@ -224,6 +372,10 @@ cmd_pack() {
 	require_source "$dir"
 	mkdir -p "$out"
 
+	# Only go.mod and go.sum may change between fetch and pack.
+	[ "$(tree_sha256 "$dir")" = "$(cat "$dir/.mc-update/tree-sha256")" ] ||
+		die "$dir changed since fetch beyond go.mod and go.sum; fetch it again"
+
 	echo "Vendoring and test build with $GO_IMAGE..."
 	go_run "$dir" sh -c '
 		set -e
@@ -251,17 +403,25 @@ cmd_pack() {
 }
 
 cmd_all() {
-	local commit=$DEFAULT_COMMIT dir=mc-src out=. opt
+	local commit="" archive="" dir=mc-src out=. opt
 	OPTIND=1
-	while getopts c:d:o: opt; do
+	while getopts c:a:d:o: opt; do
 		case $opt in
 		c) commit=$OPTARG ;;
+		a) archive=$OPTARG ;;
 		d) dir=$OPTARG ;;
 		o) out=$OPTARG ;;
 		*) die "unknown option; see mc-update help" ;;
 		esac
 	done
-	cmd_fetch -c "$commit" -d "$dir"
+	if [ -n "$archive" ]; then
+		[ -n "$commit" ] && die "use -c or -a, not both"
+		cmd_fetch -a "$archive" -d "$dir"
+	elif [ -n "$commit" ]; then
+		cmd_fetch -c "$commit" -d "$dir"
+	else
+		cmd_fetch -d "$dir"
+	fi
 	echo
 	cmd_bump -d "$dir"
 	echo
