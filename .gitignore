@@ -1,0 +1,4 @@
+mc-src/
+dist/
+*.tar.gz
+*.tar.gz.sha256
